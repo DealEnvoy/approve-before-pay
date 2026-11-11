@@ -313,7 +313,7 @@ export function buildWorkersRunBody(model: string, text: string) {
 }
 
 type WorkersToolCall = { name?: string; arguments?: unknown };
-type WorkersResult = { response?: string; tool_calls?: WorkersToolCall[] };
+type WorkersResult = { response?: string; tool_calls?: WorkersToolCall[]; model?: string };
 
 export function readWorkersResult(payload: unknown): WorkersResult {
   if (!payload || typeof payload !== "object") return {};
@@ -324,7 +324,8 @@ export function readWorkersResult(payload: unknown): WorkersResult {
   }
   const inner = record.result && typeof record.result === "object" && !Array.isArray(record.result) ? record.result : payload;
   const result = inner as WorkersResult & { tool_calls?: WorkersToolCall[] };
-  return { response: typeof result.response === "string" ? result.response : undefined, tool_calls: result.tool_calls };
+  const model = typeof (result as { model?: unknown }).model === "string" ? (result as { model: string }).model : undefined;
+  return { response: typeof result.response === "string" ? result.response : undefined, tool_calls: result.tool_calls, model };
 }
 
 export async function workersExtract(text: string, config: RemoteConfig, fetchImpl: typeof fetch): Promise<Extraction> {
@@ -360,10 +361,15 @@ export async function workersExtract(text: string, config: RemoteConfig, fetchIm
   } else {
     throw new Error("Workers AI returned neither a propose_payment tool call nor JSON");
   }
+  const reportedModel = result.model?.trim() || config.model;
+  const requestedNote =
+    reportedModel === config.model
+      ? `One POST to /accounts/{account_id}/ai/run/${config.model}.`
+      : `Requested model was ${config.model}. One POST to /accounts/{account_id}/ai/run/${config.model}.`;
   const extraction = extractionFromParsed(parsed, {
     provider: "cloudflare",
-    model: config.model,
-    note: `Cloudflare Workers AI ran ${config.model} with ${how}. One POST to /accounts/{account_id}/ai/run/${config.model}.`,
+    model: reportedModel,
+    note: `Cloudflare Workers AI ran ${reportedModel} with ${how}. ${requestedNote}`,
   });
   return extraction;
 }

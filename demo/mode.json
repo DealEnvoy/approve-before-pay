@@ -1,5 +1,5 @@
 {
-  "banner": "WHAT IS RUNNING\n\nPayPal: mock mode\n\nNo live PayPal call is made.\n\nAI: offline fallback\n\noffline-rules-v1",
+  "banner": "WHAT IS RUNNING\n\nPayPal: sandbox\n\nOrders v2 on the sandbox API.\n\nAI: Cloudflare Workers AI is configured as @cf/meta/llama-3.3-70b-instruct-fp8-fast. No request is on screen yet.\n\nConfigured for Cloudflare Workers AI model @cf/meta/llama-3.3-70b-instruct-fp8-fast (function calling). The audit names this model only after Workers AI answers.",
   "base": "http://127.0.0.1:4317",
-  "at": "2026-11-11T17:00:33.882Z"
+  "at": "2026-11-11T22:17:17.963Z"
 }

@@ -92,6 +92,29 @@ describe("AI provider selection", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("records the model name Workers AI reports when it differs from the requested model", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        result: {
+          model: "@cf/meta/llama-3.3-70b-json",
+          tool_calls: [{ name: "propose_payment", arguments: TOOL_ARGS }],
+        },
+      }),
+    }));
+    const agent = createAgent(
+      { CLOUDFLARE_ACCOUNT_ID: "acc", CLOUDFLARE_API_TOKEN: "cf-token" },
+      fetchImpl as unknown as typeof fetch,
+    );
+    const extracted = await agent.extract("Plumber needs a £150 deposit to book a boiler service next Tuesday");
+    expect(extracted.ai.provider).toBe("cloudflare");
+    expect(extracted.ai.model).toBe("@cf/meta/llama-3.3-70b-json");
+    expect(extracted.ai.note).toContain("Requested model was @cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(extracted.ai.note).toContain("function calling");
+  });
+
   it("uses strict JSON for a Workers AI model without function calling", async () => {
     const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
