@@ -96,19 +96,18 @@ Copy `.env.example` to `.env.local` if you want to change mode. Restart the dev 
 
 ### Switch to PayPal sandbox
 
-1. Create a REST app at [developer.paypal.com](https://developer.paypal.com/) and copy the sandbox client id and secret.
-2. In `.env.local`:
+Create a REST app at [developer.paypal.com](https://developer.paypal.com/) and put the sandbox client id and secret in `.env.local`:
 
 ```
-PAYPAL_MODE=sandbox
 PAYPAL_CLIENT_ID=your_sandbox_client_id
 PAYPAL_CLIENT_SECRET=your_sandbox_secret
 ```
 
-3. Restart `npm run dev`. The banner should say sandbox, not mock mode.
-4. Orders are created on the sandbox merchant for those credentials. Capture still happens only after approval in this app. If PayPal returns `ORDER_NOT_APPROVED`, the payer has not approved the order yet. The audit keeps the failure and does not mark the case captured.
+Restart `npm run dev`. With both values set, the desk uses the sandbox. With either value missing, it stays in mock mode. `PAYPAL_MODE=mock` forces mock even when the credentials are present.
 
-Leave the variables empty, or set `PAYPAL_MODE=mock`, to force mock mode even if old credentials are present.
+Orders are created on the sandbox merchant for those credentials. Capture in the desk still waits for approval in this app. If PayPal returns `ORDER_NOT_APPROVED`, the payer has not approved the order yet. The audit keeps the failure and does not mark the case captured.
+
+To send a published sandbox test card on desk capture, set `PAYPAL_CAPTURE_WITH_TEST_CARD=true`. That is optional. The smoke command below sends PayPal's published sandbox Visa on its own capture call.
 
 ### Switch to a real model
 
@@ -129,7 +128,9 @@ CLOUDFLARE_API_TOKEN=your_token
 CLOUDFLARE_AI_MODEL=@cf/meta/llama-3.1-8b-instruct
 ```
 
-Restart the server. The banner names the provider. Each case also records which provider actually produced that proposal.
+Restart the server. Before a request is on screen, the banner names the configured provider and says no request has run yet. After a request, the banner and the audit log show the provider and the model id that actually answered. For OpenAI that is the `model` field on the chat completion, which may be a dated snapshot such as `gpt-4o-mini-2024-07-18`, not only the name you requested. If the call fails or the process hits `OPENAI_MAX_CALLS` (default 20), the case falls back to `offline-rules-v1` and the text says the model result was not kept.
+
+Each OpenAI request is one `POST /v1/chat/completions` call with `tools`, `tool_choice` forced to `propose_payment`, `strict: true`, and `max_completion_tokens` 500.
 
 ## Tests
 
@@ -137,7 +138,35 @@ Restart the server. The banner names the provider. Each case also records which 
 npm test
 ```
 
-The tests cover the approval gate: capture is refused before approval, refused when risk flags are not acknowledged, refused after rejection, and refused after an edit clears approval. They also check that create does not call capture, that a quote missing from the text is flagged, and that the sandbox client posts to `/v2/checkout/orders` and only hits the capture URL when capture is requested.
+The tests cover the approval gate: capture is refused before approval, refused when risk flags are not acknowledged, refused after rejection, and refused after an edit clears approval. They also check that create does not call capture, that a quote missing from the text is flagged, that the sandbox client posts to `/v2/checkout/orders` and only hits the capture URL when capture is requested, and that an OpenAI tool call records the model id from the response and stops at `OPENAI_MAX_CALLS`.
+
+### Sandbox smoke
+
+With `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET` in the environment:
+
+```bash
+npm run sandbox:smoke
+```
+
+This gets a sandbox access token, creates a 1.00 USD order with intent `CAPTURE`, reads it, then captures it using PayPal's published sandbox Visa `4012000033330026` (or `PAYPAL_TEST_CARD_NUMBER` if you set one). It prints the order id and the create, read, and capture statuses. It does not print the client secret or the card number. It exits with an error if capture does not come back `COMPLETED`. The desk is not involved, so this does not pass the human approval gate.
+
+### Record the demo
+
+Start the desk first so it sees the same environment (`npm run dev` loads `.env.local`). Then:
+
+```bash
+npm run demo:record
+```
+
+Playwright drives the full flow against `http://127.0.0.1:4317` and writes:
+
+- `demo/approve-before-pay-demo.mp4` (about 1 to 2 minutes)
+- `demo/01-proposal.png`
+- `demo/02-capture-refused.png`
+- `demo/03-captured.png`
+- `demo/mode.json` (the banner text from that run)
+
+The recording uses whatever PayPal and AI mode the running server is in.
 
 ## Demo files
 
@@ -146,7 +175,20 @@ The tests cover the approval gate: capture is refused before approval, refused w
 - `demo/02-capture-refused.png`
 - `demo/03-captured.png`
 
-`npm run demo` records them again against the dev server. It does not change the mode. It writes `demo/mode.json` with the banner text from that run.
+The files above were recorded in mock PayPal mode with the offline extractor, because this environment had no PayPal or OpenAI credentials. Run `npm run demo:record` again on a machine that has the keys if the video should show a live model or the sandbox.
+
+## Built with
+
+- PayPal Orders v2 (`POST /v2/checkout/orders`, `GET /v2/checkout/orders/{id}`, `POST /v2/checkout/orders/{id}/capture`, plus `POST /v1/oauth2/token` in sandbox). Mock mode is the default when credentials are absent.
+- OpenAI Chat Completions `POST /v1/chat/completions` with strict tool `propose_payment`. Requested model defaults to `gpt-4o-mini`. The audit stores the model id OpenAI returns. Offline rules `offline-rules-v1` run when no key is set.
+- Next.js, React, and TypeScript.
+
+Final run on the machine that holds the keys. Fill these in after `npm run sandbox:smoke` and `npm run demo:record`. Do not invent them.
+
+- PayPal mode: [sandbox or mock]
+- Smoke order id: [order id printed by sandbox:smoke]
+- Smoke capture status: [status printed by sandbox:smoke]
+- AI that ran in the recording: [model id from the audit or the banner, or offline-rules-v1]
 
 ## Devpost pitch
 

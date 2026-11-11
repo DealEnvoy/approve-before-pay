@@ -8,7 +8,9 @@
     "start": "next start --hostname 0.0.0.0 --port 4317",
     "lint": "eslint",
     "test": "vitest run",
-    "demo": "node scripts/record-demo.mjs"
+    "demo": "npm run demo:record",
+    "demo:record": "node scripts/record-demo.mjs && ffmpeg -y -i demo/raw/demo.webm -c:v libx264 -pix_fmt yuv420p -movflags +faststart demo/approve-before-pay-demo.mp4",
+    "sandbox:smoke": "node scripts/sandbox-smoke.mjs"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.17",

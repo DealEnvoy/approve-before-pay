@@ -324,9 +324,14 @@ export function Desk() {
               {meta.paypal.mode === "mock" ? "No live PayPal call is made." : "Orders v2 on the sandbox API."}
             </p>
             <p>
-              <strong>AI:</strong> {providerLabel(meta.ai)}
+              <strong>AI:</strong>{" "}
+              {view === "case" && detail
+                ? `${providerLabel(detail.record.ai)} ran ${detail.record.ai.model}`
+                : `${providerLabel(meta.ai)} is configured as ${meta.ai.model}. No request is on screen yet.`}
             </p>
-            <p className="mode-note">{meta.ai.model}</p>
+            <p className="mode-note">
+              {view === "case" && detail ? detail.record.ai.note : meta.ai.note}
+            </p>
           </div>
         ) : null}
         <div className="rail-list">

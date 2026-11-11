@@ -23,35 +23,40 @@ type RemoteConfig = {
 
 const ProposeSchema = z.object({
   payeeName: z.string().min(1),
-  payeeEmail: z.string().optional().nullable(),
+  payeeEmail: z.string().nullable(),
   amount: z.string().min(1),
   currency: z.enum(["GBP", "USD", "EUR"]),
   purpose: z.string().min(1),
-  when: z.string().optional().nullable(),
-  payeeNameQuote: z.string().optional().default(""),
-  payeeEmailQuote: z.string().optional().default(""),
-  amountQuote: z.string().optional().default(""),
-  currencyQuote: z.string().optional().default(""),
-  purposeQuote: z.string().optional().default(""),
-  whenQuote: z.string().optional().default(""),
+  when: z.string().nullable(),
+  payeeNameQuote: z.string(),
+  payeeEmailQuote: z.string(),
+  amountQuote: z.string(),
+  currencyQuote: z.string(),
+  purposeQuote: z.string(),
+  whenQuote: z.string(),
 });
 
+const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
+const DEFAULT_OPENAI_MAX_CALLS = 20;
+const MAX_COMPLETION_TOKENS = 500;
+
 const TOOL = {
-  type: "function",
+  type: "function" as const,
   function: {
     name: "propose_payment",
     description:
-      "Record one payment proposal. Every quote must be an exact contiguous copy from the request. Use an empty string when a value is absent.",
+      "Record one payment proposal. Every quote must be an exact contiguous copy from the request. Use an empty string when a quote is absent. Use null when payeeEmail or when is absent.",
+    strict: true,
     parameters: {
       type: "object",
       additionalProperties: false,
       properties: {
         payeeName: { type: "string" },
-        payeeEmail: { type: "string" },
+        payeeEmail: { type: ["string", "null"] },
         amount: { type: "string", description: "Decimal amount such as 150.00" },
         currency: { type: "string", enum: ["GBP", "USD", "EUR"] },
         purpose: { type: "string" },
-        when: { type: "string" },
+        when: { type: ["string", "null"] },
         payeeNameQuote: { type: "string" },
         payeeEmailQuote: { type: "string" },
         amountQuote: { type: "string" },
@@ -80,8 +85,8 @@ const TOOL = {
 const SYSTEM_PROMPT = [
   "You prepare one payment proposal from a plain language request.",
   "Call the propose_payment tool once.",
-  "Copy each source quote character for character from the request.",
-  "Do not invent an email. Use an empty string when a value is absent.",
+  "Copy each source quote character for character from the request. Use an empty string when a quote is absent.",
+  "Do not invent an email. payeeEmail and when are null when the request does not contain them.",
   "amount uses two decimal places. currency is GBP, USD, or EUR.",
   "If several amounts appear, choose the deposit or the up front figure and quote that figure only.",
   "purpose is a short description of what the payment is for.",
@@ -117,8 +122,16 @@ export function resolveAiConfig(env: Record<string, string | undefined>): Remote
   return { kind: "offline", note: OFFLINE_NO_KEY_NOTE };
 }
 
+export function readOpenAIMaxCalls(env: Record<string, string | undefined>): number {
+  const raw = env.OPENAI_MAX_CALLS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_OPENAI_MAX_CALLS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_OPENAI_MAX_CALLS;
+  return Math.floor(parsed);
+}
+
 function openAIConfig(env: Record<string, string | undefined>): RemoteConfig {
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = env.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
   const base = (env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
   return {
     kind: "openai",
@@ -129,7 +142,7 @@ function openAIConfig(env: Record<string, string | undefined>): RemoteConfig {
       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    note: `Called ${model} through chat completions with the propose_payment tool.`,
+    note: `Configured for OpenAI chat completions. Requested model ${model}. A model id is recorded only after OpenAI answers.`,
   };
 }
 
@@ -144,7 +157,22 @@ function cloudflareConfig(env: Record<string, string | undefined>): RemoteConfig
       Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
       "Content-Type": "application/json",
     },
-    note: `Called Cloudflare Workers AI model ${model} with the propose_payment tool.`,
+    note: `Configured for Cloudflare Workers AI model ${model}. A model id is recorded only after that API answers.`,
+  };
+}
+
+export function buildChatCompletionBody(config: RemoteConfig) {
+  return {
+    model: config.model,
+    temperature: 0,
+    max_completion_tokens: MAX_COMPLETION_TOKENS,
+    parallel_tool_calls: false,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: "" },
+    ],
+    tools: [TOOL],
+    tool_choice: { type: "function", function: { name: "propose_payment" } },
   };
 }
 
@@ -153,6 +181,8 @@ export function createAgent(
   fetchImpl: typeof fetch = fetch,
 ): Agent {
   const config = resolveAiConfig(env);
+  let openAICalls = 0;
+  const openAIMaxCalls = readOpenAIMaxCalls(env);
   return {
     describe(): AiInfo {
       if (config.kind === "offline") {
@@ -165,6 +195,14 @@ export function createAgent(
         return offlineExtract(text, config.note);
       }
       try {
+        if (config.kind === "openai") {
+          if (openAICalls >= openAIMaxCalls) {
+            throw new Error(
+              `OpenAI call cap of ${openAIMaxCalls} is reached. This request did not call the model.`,
+            );
+          }
+          openAICalls += 1;
+        }
         return await llmExtract(text, config, fetchImpl);
       } catch (error) {
         if (error instanceof GateError) throw error;
@@ -179,27 +217,28 @@ export function createAgent(
 }
 
 export async function llmExtract(text: string, config: RemoteConfig, fetchImpl: typeof fetch): Promise<Extraction> {
+  const body = buildChatCompletionBody(config);
+  body.messages[1] = { role: "user", content: text };
   const response = await fetchImpl(config.url, {
     method: "POST",
     headers: config.headers,
-    body: JSON.stringify({
-      model: config.model,
-      temperature: 0,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: text },
-      ],
-      tools: [TOOL],
-      tool_choice: { type: "function", function: { name: "propose_payment" } },
-    }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(25000),
   });
 
   if (!response.ok) {
-    throw new Error(`${config.provider} returned HTTP ${response.status}`);
+    let detail = "";
+    try {
+      const errBody = (await response.json()) as { error?: { message?: string } };
+      if (errBody?.error?.message) detail = `: ${String(errBody.error.message).slice(0, 240)}`;
+    } catch {
+      detail = "";
+    }
+    throw new Error(`${config.provider} returned HTTP ${response.status}${detail}`);
   }
 
   const payload = (await response.json()) as {
+    model?: string;
     choices?: Array<{
       message?: {
         tool_calls?: Array<{ function?: { name?: string; arguments?: unknown } }>;
@@ -225,6 +264,8 @@ export async function llmExtract(text: string, config: RemoteConfig, fetchImpl: 
     purpose: parsed.purposeQuote,
     when: parsed.whenQuote,
   };
+  const reportedModel = payload.model?.trim() || config.model;
+  const providerName = config.provider === "openai" ? "OpenAI" : "Cloudflare Workers AI";
   return {
     proposal: {
       payeeName: parsed.payeeName.trim(),
@@ -237,8 +278,8 @@ export async function llmExtract(text: string, config: RemoteConfig, fetchImpl: 
     quotes,
     ai: {
       provider: config.provider,
-      model: config.model,
-      note: config.note,
+      model: reportedModel,
+      note: `${providerName} returned model ${reportedModel} from one chat completions call with tool propose_payment. Requested model was ${config.model}.`,
     },
   };
 }
