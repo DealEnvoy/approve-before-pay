@@ -9,7 +9,7 @@ Built by Isaac Adekunle / Drew & Crew with AI coding agents, for the PayPal AI H
 The recorded demo video and the screenshots in `demo/` were made with:
 
 - **PayPal: mock mode.** `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET` were not set. No live PayPal call was made. No money moved.
-- **AI: offline fallback, model `offline-rules-v1`.** `OPENAI_API_KEY` was not set, and Cloudflare Workers AI credentials were not set. A language model was not called.
+- **AI: offline fallback, model `offline-rules-v1`.** `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` were not set, and `OPENAI_API_KEY` was not set. A language model was not called.
 
 The banner in the app states the same thing while it is running. Do not describe this demo as a live PayPal charge or a live model call.
 
@@ -73,11 +73,11 @@ A real capture often still needs the payer to approve the order in PayPal, unles
 
 | Provider | When it is used | Model |
 | --- | --- | --- |
-| OpenAI | `OPENAI_API_KEY` is set, or `AI_PROVIDER=openai` | `OPENAI_MODEL`, default `gpt-4o-mini`. Chat completions with tool `propose_payment`. |
-| Cloudflare Workers AI | Cloudflare account id and API token are set, and OpenAI is not | `CLOUDFLARE_AI_MODEL`, default `@cf/meta/llama-3.1-8b-instruct`, via the OpenAI compatible endpoint and the same tool. |
-| Offline fallback | No key, or `AI_PROVIDER=offline`, or the model call fails | `offline-rules-v1`. Rules for amounts, payee, purpose, timing, and email. |
+| Cloudflare Workers AI | `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are set. This is the default. | `CF_AI_MODEL`, default `@cf/meta/llama-3.3-70b-instruct-fp8-fast`. `POST /accounts/{account_id}/ai/run/{model}`. Function calling for `propose_payment` when the model supports it. Otherwise one JSON object, checked with the same schema. |
+| OpenAI | Workers AI credentials are absent and `OPENAI_API_KEY` is set, or `AI_PROVIDER=openai` | `OPENAI_MODEL`, default `gpt-4o-mini`. Chat completions with tool `propose_payment`. |
+| Offline fallback | No credentials, `AI_PROVIDER=offline`, or the model call fails or hits the call cap | `offline-rules-v1`. Rules for amounts, payee, purpose, timing, and email. |
 
-`AI_PROVIDER=auto` picks OpenAI, then Cloudflare, then offline.
+`AI_PROVIDER=auto` picks Workers AI, then OpenAI, then offline.
 
 If a configured model call fails, the case falls back to `offline-rules-v1` and the audit says the model result was not kept.
 
@@ -111,7 +111,16 @@ To send a published sandbox test card on desk capture, set `PAYPAL_CAPTURE_WITH_
 
 ### Switch to a real model
 
-OpenAI:
+Cloudflare Workers AI is the default. Put the account id and token in `.env.local`:
+
+```
+CLOUDFLARE_ACCOUNT_ID=your_account_id
+CLOUDFLARE_API_TOKEN=your_token
+```
+
+Leave `CF_AI_MODEL` unset to use `@cf/meta/llama-3.3-70b-instruct-fp8-fast`. That model supports function calling, so the desk sends `propose_payment` as a tool. Set `CF_AI_MODEL` only when you want a different Workers AI model. Models that do not support function calling get one JSON reply, which this app checks with the same schema.
+
+OpenAI is optional. It runs when Workers AI credentials are absent and `OPENAI_API_KEY` is set, or when you force it:
 
 ```
 AI_PROVIDER=openai
@@ -119,18 +128,7 @@ OPENAI_API_KEY=your_key
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-Cloudflare Workers AI:
-
-```
-AI_PROVIDER=cloudflare
-CLOUDFLARE_ACCOUNT_ID=your_account_id
-CLOUDFLARE_API_TOKEN=your_token
-CLOUDFLARE_AI_MODEL=@cf/meta/llama-3.1-8b-instruct
-```
-
-Restart the server. Before a request is on screen, the banner names the configured provider and says no request has run yet. After a request, the banner and the audit log show the provider and the model id that actually answered. For OpenAI that is the `model` field on the chat completion, which may be a dated snapshot such as `gpt-4o-mini-2024-07-18`, not only the name you requested. If the call fails or the process hits `OPENAI_MAX_CALLS` (default 20), the case falls back to `offline-rules-v1` and the text says the model result was not kept.
-
-Each OpenAI request is one `POST /v1/chat/completions` call with `tools`, `tool_choice` forced to `propose_payment`, `strict: true`, and `max_completion_tokens` 500.
+Restart the server. Before a request is on screen, the banner names the configured provider and says no request has run yet. After a request, the banner and the audit log show the provider and the model name that ran. For Workers AI that name is the model on the run URL. For OpenAI it is the `model` field on the chat completion. If the call fails or the process hits `AI_MAX_CALLS` (default 20), the case falls back to `offline-rules-v1` and the text says the model result was not kept.
 
 ## Tests
 
@@ -138,7 +136,7 @@ Each OpenAI request is one `POST /v1/chat/completions` call with `tools`, `tool_
 npm test
 ```
 
-The tests cover the approval gate: capture is refused before approval, refused when risk flags are not acknowledged, refused after rejection, and refused after an edit clears approval. They also check that create does not call capture, that a quote missing from the text is flagged, that the sandbox client posts to `/v2/checkout/orders` and only hits the capture URL when capture is requested, and that an OpenAI tool call records the model id from the response and stops at `OPENAI_MAX_CALLS`.
+The tests cover the approval gate: capture is refused before approval, refused when risk flags are not acknowledged, refused after rejection, and refused after an edit clears approval. They also check that create does not call capture, that a quote missing from the text is flagged, that the sandbox client posts to `/v2/checkout/orders` and only hits the capture URL when capture is requested, and that a Workers AI tool call and a JSON reply both record the model name, and that the call cap stops further model calls.
 
 ### Sandbox smoke
 
@@ -179,8 +177,8 @@ The files above were recorded in mock PayPal mode with the offline extractor, be
 
 ## Built with
 
-- PayPal Orders v2 (`POST /v2/checkout/orders`, `GET /v2/checkout/orders/{id}`, `POST /v2/checkout/orders/{id}/capture`, plus `POST /v1/oauth2/token` in sandbox). Mock mode is the default when credentials are absent.
-- OpenAI Chat Completions `POST /v1/chat/completions` with strict tool `propose_payment`. Requested model defaults to `gpt-4o-mini`. The audit stores the model id OpenAI returns. Offline rules `offline-rules-v1` run when no key is set.
+- PayPal Orders v2 sandbox (`POST /v1/oauth2/token`, `POST /v2/checkout/orders` with intent `CAPTURE`, `GET /v2/checkout/orders/{id}`, `POST /v2/checkout/orders/{id}/capture`). Mock mode is what runs when `PAYPAL_CLIENT_ID` or `PAYPAL_CLIENT_SECRET` is absent.
+- Cloudflare Workers AI `POST /accounts/{account_id}/ai/run/{model}`. Default model `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, override `CF_AI_MODEL`. Function calling for `propose_payment` on that model. OpenAI chat completions remain an optional fallback. Offline rules `offline-rules-v1` run when no credentials are set.
 - Next.js, React, and TypeScript.
 
 Final run on the machine that holds the keys. Fill these in after `npm run sandbox:smoke` and `npm run demo:record`. Do not invent them.
@@ -188,7 +186,7 @@ Final run on the machine that holds the keys. Fill these in after `npm run sandb
 - PayPal mode: [sandbox or mock]
 - Smoke order id: [order id printed by sandbox:smoke]
 - Smoke capture status: [status printed by sandbox:smoke]
-- AI that ran in the recording: [model id from the audit or the banner, or offline-rules-v1]
+- AI that ran in the recording: [Workers AI model name from the audit, OpenAI model id, or offline-rules-v1]
 
 ## Devpost pitch
 

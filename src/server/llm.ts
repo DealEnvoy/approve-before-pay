@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { normalizeAmountInput } from "@/lib/money";
 import { OFFLINE_NO_KEY_NOTE, offlineExtract, type OfflineExtraction } from "@/lib/offline-agent";
-import type { AiInfo, Currency, FieldName } from "@/lib/types";
+import type { AiInfo, Currency } from "@/lib/types";
 import { GateError } from "./errors";
 
 export type Extraction = OfflineExtraction;
@@ -37,7 +37,8 @@ const ProposeSchema = z.object({
 });
 
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
-const DEFAULT_OPENAI_MAX_CALLS = 20;
+const DEFAULT_WORKERS_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const DEFAULT_MAX_CALLS = 20;
 const MAX_COMPLETION_TOKENS = 500;
 
 const TOOL = {
@@ -90,7 +91,17 @@ const SYSTEM_PROMPT = [
   "amount uses two decimal places. currency is GBP, USD, or EUR.",
   "If several amounts appear, choose the deposit or the up front figure and quote that figure only.",
   "purpose is a short description of what the payment is for.",
-  "when is the timing phrase, or an empty string.",
+  "when is the timing phrase, or null.",
+].join(" ");
+
+const JSON_SYSTEM_PROMPT = [
+  "You prepare one payment proposal from a plain language request.",
+  "Reply with one JSON object and no markdown.",
+  "Fields: payeeName, payeeEmail, amount, currency, purpose, when, payeeNameQuote, payeeEmailQuote, amountQuote, currencyQuote, purposeQuote, whenQuote.",
+  "currency is GBP, USD, or EUR. amount uses two decimal places.",
+  "Quotes are exact copies from the request. Use an empty string when a quote is absent.",
+  "payeeEmail and when are null when the request does not contain them.",
+  "If several amounts appear, choose the deposit or the up front figure.",
 ].join(" ");
 
 export function resolveAiConfig(env: Record<string, string | undefined>): RemoteConfig | { kind: "offline"; note: string } {
@@ -117,17 +128,39 @@ export function resolveAiConfig(env: Record<string, string | undefined>): Remote
     }
     return cloudflareConfig(env);
   }
-  if (hasOpenAI) return openAIConfig(env);
   if (hasCloudflare) return cloudflareConfig(env);
+  if (hasOpenAI) return openAIConfig(env);
   return { kind: "offline", note: OFFLINE_NO_KEY_NOTE };
 }
 
-export function readOpenAIMaxCalls(env: Record<string, string | undefined>): number {
-  const raw = env.OPENAI_MAX_CALLS;
-  if (raw === undefined || raw.trim() === "") return DEFAULT_OPENAI_MAX_CALLS;
+export function readMaxCalls(env: Record<string, string | undefined>): number {
+  const raw = env.AI_MAX_CALLS ?? env.OPENAI_MAX_CALLS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_CALLS;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_OPENAI_MAX_CALLS;
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MAX_CALLS;
   return Math.floor(parsed);
+}
+
+export function readOpenAIMaxCalls(env: Record<string, string | undefined>): number {
+  return readMaxCalls(env);
+}
+
+export function workersModelName(env: Record<string, string | undefined>): string {
+  return env.CF_AI_MODEL?.trim() || env.CLOUDFLARE_AI_MODEL?.trim() || DEFAULT_WORKERS_MODEL;
+}
+
+export function modelSupportsFunctionCalling(model: string): boolean {
+  const name = model.toLowerCase();
+  if (name.includes("llama-3") && name.includes("instruct")) return true;
+  if (name.includes("hermes-2-pro")) return true;
+  return false;
+}
+
+export function workersRunUrl(accountId: string, model: string): string {
+  if (!/^[@a-zA-Z0-9_./-]+$/.test(model)) {
+    throw new GateError("BAD_MODEL", 500, "CF_AI_MODEL contains characters that are not allowed in a Workers AI model name.");
+  }
+  return `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`;
 }
 
 function openAIConfig(env: Record<string, string | undefined>): RemoteConfig {
@@ -147,17 +180,19 @@ function openAIConfig(env: Record<string, string | undefined>): RemoteConfig {
 }
 
 function cloudflareConfig(env: Record<string, string | undefined>): RemoteConfig {
-  const model = env.CLOUDFLARE_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+  const model = workersModelName(env);
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID?.trim() ?? "";
+  const mode = modelSupportsFunctionCalling(model) ? "function calling" : "strict JSON";
   return {
     kind: "cloudflare",
     provider: "cloudflare",
     model,
-    url: `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`,
+    url: workersRunUrl(accountId, model),
     headers: {
       Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
       "Content-Type": "application/json",
     },
-    note: `Configured for Cloudflare Workers AI model ${model}. A model id is recorded only after that API answers.`,
+    note: `Configured for Cloudflare Workers AI model ${model} (${mode}). The audit names this model only after Workers AI answers.`,
   };
 }
 
@@ -181,8 +216,8 @@ export function createAgent(
   fetchImpl: typeof fetch = fetch,
 ): Agent {
   const config = resolveAiConfig(env);
-  let openAICalls = 0;
-  const openAIMaxCalls = readOpenAIMaxCalls(env);
+  let remoteCalls = 0;
+  const maxCalls = readMaxCalls(env);
   return {
     describe(): AiInfo {
       if (config.kind === "offline") {
@@ -195,15 +230,13 @@ export function createAgent(
         return offlineExtract(text, config.note);
       }
       try {
-        if (config.kind === "openai") {
-          if (openAICalls >= openAIMaxCalls) {
-            throw new Error(
-              `OpenAI call cap of ${openAIMaxCalls} is reached. This request did not call the model.`,
-            );
-          }
-          openAICalls += 1;
+        if (remoteCalls >= maxCalls) {
+          const who = config.kind === "openai" ? "OpenAI" : "Workers AI";
+          throw new Error(`${who} call cap of ${maxCalls} is reached. This request did not call the model.`);
         }
-        return await llmExtract(text, config, fetchImpl);
+        remoteCalls += 1;
+        if (config.kind === "openai") return await llmExtract(text, config, fetchImpl);
+        return await workersExtract(text, config, fetchImpl);
       } catch (error) {
         if (error instanceof GateError) throw error;
         const reason = error instanceof Error ? error.message : "model call failed";
@@ -250,37 +283,127 @@ export async function llmExtract(text: string, config: RemoteConfig, fetchImpl: 
     throw new Error(`${config.provider} returned no propose_payment tool call`);
   }
   const parsed = parseToolArguments(toolCall.function.arguments);
+  const reportedModel = payload.model?.trim() || config.model;
+  return extractionFromParsed(parsed, {
+    provider: "openai",
+    model: reportedModel,
+    note: `OpenAI returned model ${reportedModel} from one chat completions call with tool propose_payment. Requested model was ${config.model}.`,
+  });
+}
+
+export function buildWorkersRunBody(model: string, text: string) {
+  const messages = [
+    { role: "system", content: modelSupportsFunctionCalling(model) ? SYSTEM_PROMPT : JSON_SYSTEM_PROMPT },
+    { role: "user", content: text },
+  ];
+  if (!modelSupportsFunctionCalling(model)) {
+    return { messages, max_tokens: MAX_COMPLETION_TOKENS };
+  }
+  return {
+    messages,
+    max_tokens: MAX_COMPLETION_TOKENS,
+    tools: [
+      {
+        name: "propose_payment",
+        description: TOOL.function.description,
+        parameters: TOOL.function.parameters,
+      },
+    ],
+  };
+}
+
+type WorkersToolCall = { name?: string; arguments?: unknown };
+type WorkersResult = { response?: string; tool_calls?: WorkersToolCall[] };
+
+export function readWorkersResult(payload: unknown): WorkersResult {
+  if (!payload || typeof payload !== "object") return {};
+  const record = payload as { success?: boolean; errors?: Array<{ message?: string }>; result?: unknown };
+  if (record.success === false) {
+    const message = record.errors?.map((item) => item.message).filter(Boolean).join(" ") || "Workers AI reported failure";
+    throw new Error(message);
+  }
+  const inner = record.result && typeof record.result === "object" && !Array.isArray(record.result) ? record.result : payload;
+  const result = inner as WorkersResult & { tool_calls?: WorkersToolCall[] };
+  return { response: typeof result.response === "string" ? result.response : undefined, tool_calls: result.tool_calls };
+}
+
+export async function workersExtract(text: string, config: RemoteConfig, fetchImpl: typeof fetch): Promise<Extraction> {
+  const useTools = modelSupportsFunctionCalling(config.model);
+  const response = await fetchImpl(config.url, {
+    method: "POST",
+    headers: config.headers,
+    body: JSON.stringify(buildWorkersRunBody(config.model, text)),
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const errBody = (await response.json()) as { errors?: Array<{ message?: string }> };
+      const message = errBody.errors?.map((item) => item.message).filter(Boolean).join(" ");
+      if (message) detail = `: ${message.slice(0, 240)}`;
+    } catch {
+      detail = "";
+    }
+    throw new Error(`cloudflare returned HTTP ${response.status}${detail}`);
+  }
+  const payload = await response.json();
+  const result = readWorkersResult(payload);
+  const toolCall = result.tool_calls?.find((call) => call.name === "propose_payment") ?? result.tool_calls?.[0];
+  let parsed: z.infer<typeof ProposeSchema>;
+  let how: "function calling" | "strict JSON";
+  if (useTools && toolCall?.arguments !== undefined) {
+    parsed = parseToolArguments(toolCall.arguments);
+    how = "function calling";
+  } else if (result.response) {
+    parsed = parseModelJson(result.response);
+    how = "strict JSON";
+  } else {
+    throw new Error("Workers AI returned neither a propose_payment tool call nor JSON");
+  }
+  const extraction = extractionFromParsed(parsed, {
+    provider: "cloudflare",
+    model: config.model,
+    note: `Cloudflare Workers AI ran ${config.model} with ${how}. One POST to /accounts/{account_id}/ai/run/${config.model}.`,
+  });
+  return extraction;
+}
+
+export function parseModelJson(text: string): z.infer<typeof ProposeSchema> {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const raw = fenced ? fenced[1].trim() : trimmed;
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("Workers AI response was not JSON");
+  return parseToolArguments(raw.slice(start, end + 1));
+}
+
+function extractionFromParsed(
+  parsed: z.infer<typeof ProposeSchema>,
+  ai: { provider: "openai" | "cloudflare"; model: string; note: string },
+): Extraction {
   const amount = normalizeAmountInput(parsed.amount);
   if (!amount || Number(amount) <= 0) {
     throw new Error("the tool call did not include a usable amount");
   }
-  const email = cleanOptional(parsed.payeeEmail);
-  const when = cleanOptional(parsed.when);
-  const quotes: Partial<Record<FieldName, string>> = {
-    payeeName: parsed.payeeNameQuote,
-    payeeEmail: parsed.payeeEmailQuote,
-    amount: parsed.amountQuote,
-    currency: parsed.currencyQuote,
-    purpose: parsed.purposeQuote,
-    when: parsed.whenQuote,
-  };
-  const reportedModel = payload.model?.trim() || config.model;
-  const providerName = config.provider === "openai" ? "OpenAI" : "Cloudflare Workers AI";
   return {
     proposal: {
       payeeName: parsed.payeeName.trim(),
-      payeeEmail: email,
+      payeeEmail: cleanOptional(parsed.payeeEmail),
       amount,
       currency: parsed.currency as Currency,
       purpose: parsed.purpose.trim(),
-      when,
+      when: cleanOptional(parsed.when),
     },
-    quotes,
-    ai: {
-      provider: config.provider,
-      model: reportedModel,
-      note: `${providerName} returned model ${reportedModel} from one chat completions call with tool propose_payment. Requested model was ${config.model}.`,
+    quotes: {
+      payeeName: parsed.payeeNameQuote,
+      payeeEmail: parsed.payeeEmailQuote,
+      amount: parsed.amountQuote,
+      currency: parsed.currencyQuote,
+      purpose: parsed.purposeQuote,
+      when: parsed.whenQuote,
     },
+    ai,
   };
 }
 

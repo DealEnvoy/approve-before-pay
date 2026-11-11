@@ -30,7 +30,7 @@ describe("AI provider selection", () => {
     expect(extracted.ai.note.toLowerCase()).toContain("not by a language model");
   });
 
-  it("selects OpenAI or Cloudflare when those credentials exist", () => {
+  it("prefers Workers AI, then OpenAI, and honours CF_AI_MODEL", () => {
     expect(resolveAiConfig({ OPENAI_API_KEY: "test", OPENAI_MODEL: "gpt-4o-mini" })).toMatchObject({
       provider: "openai",
       model: "gpt-4o-mini",
@@ -38,14 +38,99 @@ describe("AI provider selection", () => {
     });
     expect(
       resolveAiConfig({
+        OPENAI_API_KEY: "test",
         CLOUDFLARE_ACCOUNT_ID: "acc",
         CLOUDFLARE_API_TOKEN: "tok",
-        CLOUDFLARE_AI_MODEL: "@cf/meta/llama-3.1-8b-instruct",
       }),
     ).toMatchObject({
       provider: "cloudflare",
-      model: "@cf/meta/llama-3.1-8b-instruct",
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      url: "https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     });
+    const overridden = resolveAiConfig({
+      CLOUDFLARE_ACCOUNT_ID: "acc",
+      CLOUDFLARE_API_TOKEN: "tok",
+      CF_AI_MODEL: "@cf/meta/llama-3.1-8b-instruct",
+    });
+    expect(overridden.kind).toBe("cloudflare");
+    if (overridden.kind === "cloudflare") expect(overridden.model).toBe("@cf/meta/llama-3.1-8b-instruct");
+  });
+
+  it("calls Workers AI function calling and records that model name", async () => {
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe(
+        "https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      );
+      const body = JSON.parse(String(init?.body));
+      expect(body.tools[0].name).toBe("propose_payment");
+      expect(body.tools[0].function).toBeUndefined();
+      expect(body.max_tokens).toBe(500);
+      expect(String((init?.headers as Record<string, string>).Authorization)).toBe("Bearer cf-token");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          success: true,
+          result: { response: "", tool_calls: [{ name: "propose_payment", arguments: TOOL_ARGS }] },
+        }),
+      };
+    });
+    const agent = createAgent(
+      { CLOUDFLARE_ACCOUNT_ID: "acc", CLOUDFLARE_API_TOKEN: "cf-token", AI_MAX_CALLS: "1" },
+      fetchImpl as unknown as typeof fetch,
+    );
+    const extracted = await agent.extract("Plumber needs a £150 deposit to book a boiler service next Tuesday");
+    expect(extracted.ai.provider).toBe("cloudflare");
+    expect(extracted.ai.model).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(extracted.ai.note).toContain("function calling");
+    expect(extracted.proposal.amount).toBe("150.00");
+
+    const blocked = await agent.extract("Plumber needs a £150 deposit to book a boiler service next Tuesday");
+    expect(blocked.ai.provider).toBe("offline_fallback");
+    expect(blocked.ai.model).toBe("offline-rules-v1");
+    expect(blocked.ai.note).toContain("did not call the model");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses strict JSON for a Workers AI model without function calling", async () => {
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.tools).toBeUndefined();
+      expect(body.messages[0].content).toContain("JSON");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ success: true, result: { response: "```json\n" + JSON.stringify(TOOL_ARGS) + "\n```" } }),
+      };
+    });
+    const agent = createAgent(
+      {
+        CLOUDFLARE_ACCOUNT_ID: "acc",
+        CLOUDFLARE_API_TOKEN: "cf-token",
+        CF_AI_MODEL: "@cf/baai/bge-base-en-v1.5",
+      },
+      fetchImpl as unknown as typeof fetch,
+    );
+    const extracted = await agent.extract("Plumber needs a £150 deposit to book a boiler service next Tuesday");
+    expect(extracted.ai.provider).toBe("cloudflare");
+    expect(extracted.ai.model).toBe("@cf/baai/bge-base-en-v1.5");
+    expect(extracted.ai.note).toContain("strict JSON");
+    expect(extracted.proposal.payeeName).toBe("Plumber");
+  });
+
+  it("accepts JSON text when a function calling model does not return a tool call", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ success: true, result: { response: JSON.stringify(TOOL_ARGS), tool_calls: [] } }),
+    }));
+    const agent = createAgent(
+      { CLOUDFLARE_ACCOUNT_ID: "acc", CLOUDFLARE_API_TOKEN: "cf-token" },
+      fetchImpl as unknown as typeof fetch,
+    );
+    const extracted = await agent.extract("Plumber needs a £150 deposit to book a boiler service next Tuesday");
+    expect(extracted.ai.note).toContain("strict JSON");
+    expect(extracted.ai.model).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
   });
 
   it("calls OpenAI chat completions with strict tool calling and records the returned model", async () => {

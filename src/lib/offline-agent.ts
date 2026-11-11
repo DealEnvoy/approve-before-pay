@@ -89,4 +89,4 @@ function currencyQuoteFrom(text: string, raw: string, currency: Currency): strin
 }
 
 export const OFFLINE_NO_KEY_NOTE =
-  "No OPENAI_API_KEY or Cloudflare Workers AI credentials are set. This proposal was built by the offline rules extractor, not by a language model.";
+  "No Cloudflare Workers AI credentials and no OPENAI_API_KEY are set. This proposal was built by the offline rules extractor, not by a language model.";
