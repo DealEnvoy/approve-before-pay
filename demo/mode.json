@@ -1,0 +1,5 @@
+{
+  "banner": "WHAT IS RUNNING\n\nPayPal: mock mode\n\nNo live PayPal call is made.\n\nAI: offline fallback\n\noffline-rules-v1",
+  "base": "http://127.0.0.1:4317",
+  "at": "2026-11-11T17:00:33.882Z"
+}
